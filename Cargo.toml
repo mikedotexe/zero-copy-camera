@@ -1,0 +1,12 @@
+[package]
+name = "camera-kelp-demo"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mike Purvis"]
+description = "Audio-reactive camera effects with kelp-like strands - Metal GPU demo for macOS"
+
+[dependencies]
+metal = "*"
+minifb = "0.25.0"
+nokhwa = { version = "0.10.0", features = ["input-avfoundation"] }
+cpal = "0.15"
