@@ -154,6 +154,7 @@ fn analyze_spectrum(audio_data: &[f32], spectrum: &mut [f32; 3]) {
     }
 }
 
+#[cfg(feature = "audio")]
 fn setup_audio_capture(
     audio_ring: Arc<Mutex<AudioRingBuffer>>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
