@@ -5,8 +5,18 @@ edition = "2021"
 authors = ["Mike Purvis"]
 description = "Audio-reactive camera effects with kelp-like strands - Metal GPU demo for macOS"
 
+[features]
+default = []
+audio = ["cpal"]
+
 [dependencies]
+
+[target.'cfg(target_os = "macos")'.dependencies]
 metal = "*"
 minifb = "0.25.0"
 nokhwa = { version = "0.10.0", features = ["input-avfoundation"] }
-cpal = "0.15"
+cpal = { version = "0.15", optional = true }
+cocoa = "0.24"
+objc = "0.2"
+core-graphics = "0.23"
+

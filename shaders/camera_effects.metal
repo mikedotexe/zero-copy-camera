@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <metal_atomic>
 using namespace metal;
 
 inline uint rgb8(float3 c) {
@@ -6,14 +7,37 @@ inline uint rgb8(float3 c) {
     return ((uint)s.x << 16) | ((uint)s.y << 8) | (uint)s.z;
 }
 
-inline float3 unpack_rgb(uint v) {
-    return float3(float((v >> 16) & 255), float((v >> 8) & 255), float(v & 255)) / 255.0f;
+inline float3 read_camera_rgb(device const uchar* camera,
+                              constant Params& P,
+                              int2 cropped_coord) {
+    int camera_x = cropped_coord.x + int(P.cam_offset_x);
+    int camera_y = cropped_coord.y + int(P.cam_offset_y);
+
+    camera_x = clamp(camera_x, 0, int(P.cam_stride) - 1);
+    camera_y = clamp(camera_y, 0, int(P.cam_h) - 1);
+
+    uint safe_channels = clamp(P.cam_channels, 3u, 4u);
+    uint idx = (uint(camera_y) * P.cam_stride + uint(camera_x)) * safe_channels;
+    float r = float(camera[idx]);
+    float g = float(camera[idx + 1]);
+    float b = float(camera[idx + 2]);
+    return float3(r, g, b) / 255.0;
 }
+
+struct HoleParam {
+    float4 packed;
+};
 
 struct Params {
     float time;
     uint w;
     uint h;
+    uint cam_w;
+    uint cam_h;
+    uint cam_stride;
+    uint cam_offset_x;
+    uint cam_offset_y;
+    uint cam_channels;
     float wind_strength;
     float warp_pattern;     // 0-4 for different artistic patterns
     float audio_bass;
@@ -21,7 +45,108 @@ struct Params {
     float audio_treble;
     uint show_grid;
     uint camera_mode;       // 0-2 for different camera centering approaches
+    float mouse_x;
+    float mouse_y;
+    float neural_gain;
+    uint neural_enabled;
+    uint hole_count;
+    uint hole_pad0;
+    uint hole_pad1;
+    uint hole_pad2;
+    HoleParam holes[MAX_HOLES];
 };
+
+#define PATCH_SIDE 4
+#define PATCH_PIXELS (PATCH_SIDE * PATCH_SIDE)
+#define MLP_INPUTS (PATCH_PIXELS * 3)
+#define MLP_PROJ 16
+#define MLP_OUTPUTS 3
+#define MAX_HOLES 8
+
+struct NeuralWeights {
+    float proj_bg[MLP_PROJ][MLP_INPUTS];
+    float proj_sheet[MLP_PROJ][MLP_INPUTS];
+    float bias_bg[MLP_PROJ];
+    float bias_sheet[MLP_PROJ];
+    float mix_bg[MLP_OUTPUTS][MLP_PROJ];
+    float mix_sheet[MLP_OUTPUTS][MLP_PROJ];
+    float bias_mix_bg[MLP_OUTPUTS];
+    float bias_mix_sheet[MLP_OUTPUTS];
+};
+
+struct Analysis {
+    atomic_uint heavy_ops;
+    atomic_uint mlp_energy;
+    atomic_uint brightest_activation;
+    atomic_uint edge_flux;
+};
+
+struct NeuralResult {
+    float3 background_color;
+    float3 sheet_color;
+    float combined_energy;
+    float overlay_strength;
+};
+
+inline NeuralResult evaluate_neural_projection(device const uchar* camera,
+                                               constant Params& P,
+                                               constant NeuralWeights& W,
+                                               int2 base_coord) {
+    float inputs[MLP_INPUTS];
+    int idx = 0;
+    for (int dy = -1; dy <= 2; ++dy) {
+        for (int dx = -1; dx <= 2; ++dx) {
+            float3 sample = read_camera_rgb(camera, P, base_coord + int2(dx, dy));
+            inputs[idx++] = sample.r;
+            inputs[idx++] = sample.g;
+            inputs[idx++] = sample.b;
+        }
+    }
+
+    float hidden_bg[MLP_PROJ];
+    float hidden_sheet[MLP_PROJ];
+    float bg_energy = 0.0;
+    float sheet_energy = 0.0;
+    float mouse_bias = ((P.mouse_x + P.mouse_y) - 1.0f) * 0.9f;
+    float audio_bias = P.audio_mid * 0.45f + P.audio_bass * 0.3f + P.audio_treble * 0.35f;
+
+    for (int proj = 0; proj < MLP_PROJ; ++proj) {
+        float sum_bg = W.bias_bg[proj] + mouse_bias + audio_bias;
+        float sum_sheet = W.bias_sheet[proj] + audio_bias * 1.1f;
+        for (int i = 0; i < MLP_INPUTS; ++i) {
+            sum_bg += W.proj_bg[proj][i] * inputs[i];
+            sum_sheet += W.proj_sheet[proj][i] * inputs[i];
+        }
+        float activated_bg = tanh(sum_bg);
+        float activated_sheet = tanh(sum_sheet);
+        hidden_bg[proj] = activated_bg;
+        hidden_sheet[proj] = activated_sheet;
+        bg_energy += activated_bg * activated_bg;
+        sheet_energy += activated_sheet * activated_sheet;
+    }
+
+    float outputs_bg[MLP_OUTPUTS];
+    float outputs_sheet[MLP_OUTPUTS];
+    float treble_push = P.audio_treble * 0.4f + mouse_bias * 0.3f;
+
+    for (int o = 0; o < MLP_OUTPUTS; ++o) {
+        float sum_bg = W.bias_mix_bg[o] + treble_push;
+        float sum_sheet = W.bias_mix_sheet[o] + treble_push * 1.3f;
+        for (int proj = 0; proj < MLP_PROJ; ++proj) {
+            sum_bg += W.mix_bg[o][proj] * hidden_bg[proj];
+            sum_sheet += W.mix_sheet[o][proj] * hidden_sheet[proj];
+        }
+        outputs_bg[o] = tanh(sum_bg) * 0.5f + 0.5f;
+        outputs_sheet[o] = tanh(sum_sheet) * 0.5f + 0.5f;
+    }
+
+    float3 bg_color = float3(outputs_bg[0], outputs_bg[1], outputs_bg[2]);
+    float3 sheet_color = float3(outputs_sheet[0], outputs_sheet[1], outputs_sheet[2]);
+    float energy = bg_energy + sheet_energy;
+    float overlay = clamp(energy * 0.02f + treble_push * 0.15f, 0.0f, 1.5f);
+
+    return NeuralResult{bg_color, sheet_color, energy, overlay};
+}
 
 struct SheetProperties {
     float scale;          // Size multiplier
@@ -159,7 +284,7 @@ inline float2 apply_warp(float2 pos, Params P) {
 // Render a single 2D scrolling, flapping, translucent sheet
 inline float4 render_sheet(float2 centered,
                            constant Params& P,
-                           device const uint* camera,
+                           device const uchar* camera,
                            SheetProperties props,
                            int sheet_id) {
 
@@ -340,7 +465,7 @@ inline float4 render_sheet(float2 centered,
 
     int2 cam_coord = int2(cam_uv * float2(P.w - 1, P.h - 1));
     cam_coord = clamp(cam_coord, int2(0), int2(P.w - 1, P.h - 1));
-    float3 color = unpack_rgb(camera[cam_coord.y * int(P.w) + cam_coord.x]);
+    float3 color = read_camera_rgb(camera, P, cam_coord);
 
     // Blotches removed from here - now rendered in main kernel to avoid duplication
 
@@ -381,12 +506,16 @@ inline float4 render_sheet(float2 centered,
 }
 
 // Two sheets with artistic wind effects
-kernel void render_two_sheets(device const uint* camera     [[buffer(0)]],
+kernel void render_two_sheets(device const uchar* camera    [[buffer(0)]],
                               device uint* output            [[buffer(1)]],
                               constant Params& P             [[buffer(2)]],
+                              constant NeuralWeights& W      [[buffer(3)]],
+                              device Analysis* analysis_buf  [[buffer(4)]],
                               uint2 gid                      [[thread_position_in_grid]])
 {
     if (gid.x >= P.w || gid.y >= P.h) return;
+
+    device Analysis& metrics = analysis_buf[0];
 
     // Screen coordinates
     float2 uv = float2(gid) / float2(P.w, P.h);
@@ -401,12 +530,70 @@ kernel void render_two_sheets(device const uint* camera     [[buffer(0)]],
     float2 bg_cam_uv = bg_uv;
     int2 bg_cam_coord = int2(bg_cam_uv * float2(P.w - 1, P.h - 1));
     bg_cam_coord = clamp(bg_cam_coord, int2(0), int2(P.w - 1, P.h - 1));
-    float3 bg_texture = unpack_rgb(camera[bg_cam_coord.y * int(P.w) + bg_cam_coord.x]);
+    float3 bg_texture = read_camera_rgb(camera, P, bg_cam_coord);
 
     // Darken and tint background
     float3 color = bg_texture * 0.15;
     color += float3(0.05, 0.05, 0.1);
     color += float3(0.1, 0.05, 0.2) * P.audio_bass * 0.2;
+
+    NeuralResult neural = evaluate_neural_projection(camera, P, W, bg_cam_coord);
+    const uint heavy_ops = (MLP_INPUTS * MLP_PROJ * 2) + (MLP_PROJ * MLP_OUTPUTS * 2);
+    atomic_fetch_add_explicit(&(metrics.heavy_ops), heavy_ops, memory_order_relaxed);
+    uint energy_fixed = (uint)fmin(neural.combined_energy * 8192.0f, 4294967295.0f);
+    atomic_fetch_add_explicit(&(metrics.mlp_energy), energy_fixed, memory_order_relaxed);
+
+    float neural_toggle = (P.neural_enabled > 0) ? 1.0f : 0.0f;
+    float neural_overlay = clamp(neural.overlay_strength * P.neural_gain, 0.0f, 2.0f) * neural_toggle;
+    float ai_strength = length(neural.sheet_color) * neural_toggle;
+    uint intensity_fixed = min((uint)(clamp(neural_overlay, 0.0f, 1.0f) * 1023.0f), 1023u);
+    uint packed = (intensity_fixed << 22) | ((gid.x & 0x7ff) << 11) | (gid.y & 0x7ff);
+    atomic_fetch_max_explicit(&(metrics.brightest_activation), packed, memory_order_relaxed);
+
+    float3 neural_bg_mix = float3(0.0f);
+    if (neural_toggle > 0.0f) {
+        float3 neural_palette = mix(bg_texture, neural.background_color, 0.7f);
+        float neural_drive = clamp(neural_overlay * (0.6f + P.audio_mid * 0.4f), 0.0f, 1.0f);
+        neural_palette *= (0.45f + P.audio_mid * 0.4f + P.audio_treble * 0.25f);
+        color = mix(color, neural_palette, neural_drive);
+        neural_bg_mix = neural_palette;
+    }
+
+    float swiss_mask = 0.0f;
+    float particle_ring = 0.0f;
+    float flux_energy = 0.0f;
+
+    uint hole_limit = min(P.hole_count, (uint)MAX_HOLES);
+    for (uint i = 0; i < hole_limit; ++i) {
+        float4 packed_hole = P.holes[i].packed;
+        float2 center = packed_hole.xy;
+        float radius = max(0.008f, packed_hole.z);
+        float vigor = max(0.05f, packed_hole.w);
+        float dist = distance(uv, center);
+        float inner = smoothstep(radius, radius - 0.02f, dist);
+        float rim = smoothstep(radius + 0.025f, radius - 0.006f, dist);
+        float swirl = fbm(center * 220.0f + uv * (140.0f + vigor * 65.0f) + float2(P.time * vigor * 1.4f, -P.time * vigor * 0.9f), 3);
+        float sparkle = pow(max(0.0f, 1.0f - abs(dist - radius) * (160.0f + vigor * 42.0f)), 2.2f);
+        particle_ring = max(particle_ring, rim * (0.45f + 0.55f * swirl) * sparkle);
+        swiss_mask = max(swiss_mask, inner);
+        flux_energy += rim * vigor;
+    }
+
+    float edge_distance = min(min(uv.x, 1.0f - uv.x), min(uv.y, 1.0f - uv.y));
+    float border = smoothstep(0.12f, 0.03f, edge_distance);
+    float edge_swirl = fbm(uv * 48.0f + float2(P.time * 0.6f, -P.time * 0.5f), 4);
+    particle_ring = max(particle_ring, border * max(0.0f, edge_swirl) * (0.4f + P.audio_treble * 0.6f));
+    flux_energy += border * max(0.0f, edge_swirl);
+
+    float swiss_cut = clamp(swiss_mask, 0.0f, 1.0f);
+    color = mix(color, color * 0.05f, swiss_cut);
+
+    float3 particle_color = float3(1.25f, 1.05f, 0.55f);
+    float particle_gain = 0.6f + P.audio_mid * 0.4f + P.audio_bass * 0.25f;
+    color += particle_color * particle_ring * particle_gain;
+
+    uint flux_metric = (uint)clamp((particle_ring + flux_energy * 0.3f) * 65535.0f, 0.0f, 65535.0f);
+    atomic_fetch_add_explicit(&(metrics.edge_flux), flux_metric, memory_order_relaxed);
 
     // KELP FOREST - delicate strands growing upward from bottom in organic clusters!
     const int num_strings = 25;
@@ -687,10 +874,27 @@ kernel void render_two_sheets(device const uint* camera     [[buffer(0)]],
     for (int i = 3; i >= 0; i--) {
         float4 sheet_color = render_sheet(centered, P, camera, sheets[i], i);
 
+        if (neural_toggle > 0.0f) {
+            float sheet_phase = sin(float(i) * 0.77f + P.time * 0.9f);
+            float sheet_drive = clamp(neural_overlay * (0.45f + 0.4f * sheet_phase), 0.0f, 1.0f);
+            float3 neural_sheet_mix = mix(sheet_color.rgb, neural.sheet_color, sheet_drive);
+            sheet_color.rgb = neural_sheet_mix;
+            sheet_color.a = clamp(sheet_color.a + sheet_drive * 0.25f, 0.0f, 1.0f);
+        }
+
         if (sheet_color.a > 0.01) {
             // Alpha blend: C_out = C_fg * a + C_bg * (1 - a)
             color = color * (1.0 - sheet_color.a) + sheet_color.rgb * sheet_color.a;
         }
+    }
+
+    if (neural_toggle > 0.0f) {
+        float neural_glow = clamp(
+            ai_strength * 0.35f + neural_overlay * 0.3f + P.audio_treble * 0.2f,
+            0.0f,
+            1.0f
+        );
+        color = clamp(color + neural_bg_mix * neural_glow, 0.0f, 1.0f);
     }
 
     output[gid.y * P.w + gid.x] = rgb8(clamp(color, 0.0f, 1.0f));
